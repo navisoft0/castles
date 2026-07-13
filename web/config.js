@@ -4,4 +4,4 @@
  * Leave empty to hide online play (practice vs AI still works).
  * During local development an empty value falls back to ws://localhost:8902.
  */
-window.CASTLES_SERVER = '';
+window.CASTLES_SERVER = 'wss://castles-production.up.railway.app';
