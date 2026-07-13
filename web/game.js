@@ -1,31 +1,46 @@
 'use strict';
-/* Castles — Jake's Way
- * Shed-type card game: equal-or-higher beats the pile, 2 resets, 8 burns.
- * Ported from the original Godot prototype to a self-contained HTML5 game.
+/* Castles — client. Renders per-seat views from the shared rules engine,
+ * either from a local practice game (vs bots) or from the online server.
  */
 
-// ===== layout constants (stage is a fixed 1280x720, scaled to fit) =====
+const E = window.CastlesEngine;
+
+// ===== layout constants (fixed 1280x720 stage, scaled to fit) =====
 const W = 1280, H = 720, CW = 88, CH = 120;
 const POS = {
   deck: { x: 500, y: 300 },
   pile: { x: 640, y: 300 },
   burn: { x: 780, y: 300 },
-  hand: { 0: { cx: 640, y: 580 }, 1: { cx: 640, y: 18 } },   // 0 = you, 1 = AI
-  castleY: { 0: 464, 1: 154 },
-  slotX: [520, 640, 760],
+  myHand: { cx: 640, y: 580 },
+  myCastleY: 464,
+  mySlotX: [520, 640, 760],
   msg: { x: 250, y: 330 },
+  timer: { x: 250, y: 296 },
   pickup: { x: 250, y: 396 },
 };
-const SUITS = ['hearts', 'diamonds', 'clubs', 'spades'];
+// Opponent panel geometry by opponent count
+const OPP_GEOM = {
+  1: { centers: [640], cw: 72, ch: 98 },
+  2: { centers: [390, 890], cw: 62, ch: 85 },
+  3: { centers: [260, 640, 1020], cw: 56, ch: 76 },
+};
 const RANK_NAMES = { 11: 'Jack', 12: 'Queen', 13: 'King', 14: 'Ace' };
+const BOT_NAMES = ['Ada', 'Byte', 'Cleo'];
+const CHAT_PHRASES = ['👍 Nice!', '😖 Ouch', '⏳ Hurry up', '🏰 Good game'];
 
-// ===== dom =====
 const $ = (s) => document.querySelector(s);
 const stage = $('#stage');
 const cardsLayer = $('#cards');
 const msgEl = $('#message');
 const pickupBtn = $('#pickup-btn');
 const autoBtn = $('#auto-btn');
+const timerEl = $('#turn-timer');
+
+function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+function rankName(v) { return RANK_NAMES[v] || String(v); }
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
 
 // ===== audio =====
 const SOUND_FILES = {
@@ -44,189 +59,280 @@ for (const key of Object.keys(SOUND_FILES)) {
   });
 }
 let muted = localStorage.getItem('castles-muted') === '1';
-
 function sfx(name) {
   if (muted) return;
   const pool = soundBank[name];
-  const src = pool[Math.floor(Math.random() * pool.length)];
-  const a = src.cloneNode();
+  const a = pool[Math.floor(Math.random() * pool.length)].cloneNode();
   a.volume = 0.55;
   a.play().catch(() => {});
 }
 
-// ===== state =====
-let game = null;
-let busy = true;       // blocks input during animations / AI turn
+// ===== mode / session state =====
+let mode = null;         // {kind:'local'|'online', ...}
+let view = null;         // latest rendered view
+let names = [];          // per-seat names
+let seatBots = [];       // per-seat bot flags (online)
+let seatConn = [];       // per-seat connected flags (online)
+let jitters = {};        // card id -> pile rotation
 let msgTimer = null;
+let queue = [];          // pending {view, events}
+let pumping = false;
 
-function newGame() {
-  const deck = [];
-  let id = 0;
-  for (let s = 0; s < 4; s++) {
-    for (let v = 2; v <= 14; v++) {
-      deck.push({ id: id++, s, v, jit: 0, el: null });
-    }
+const cardEls = new Map();   // card id -> element
+const ghostEls = new Map();  // key -> element
+
+// ===== geometry =====
+function relIndex(seat) {
+  return (seat - mode.mySeat + view.n) % view.n;
+}
+
+function seatGeom(seat) {
+  const rel = relIndex(seat);
+  if (rel === 0) {
+    return {
+      me: true, cw: CW, ch: CH,
+      handCx: POS.myHand.cx, handY: POS.myHand.y, handSpread: 58, handMax: 560,
+      castleY: POS.myCastleY, slotX: POS.mySlotX.slice(),
+      nameX: 185, nameY: H - 46, bubble: { x: 640, y: 530 },
+    };
   }
-  // Fisher-Yates
-  for (let i = deck.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [deck[i], deck[j]] = [deck[j], deck[i]];
-  }
+  const g = OPP_GEOM[view.n - 1];
+  const cx = g.centers[rel - 1];
+  const gap = g.cw + 12;
   return {
-    deck,
-    pile: [],
-    burned: [],
-    players: [
-      { hand: [], up: [null, null, null], down: [null, null, null] },
-      { hand: [], up: [null, null, null], down: [null, null, null] },
-    ],
-    phase: 'setupDown',   // setupDown -> setupUp -> play -> over
-    turn: 0,
+    me: false, cw: g.cw, ch: g.ch,
+    handCx: cx, handY: 32, handSpread: g.cw * 0.5, handMax: gap * 3 - 10,
+    castleY: 32 + g.ch + 16, slotX: [cx - gap, cx, cx + gap],
+    nameX: cx, nameY: 8, bubble: { x: cx, y: 32 + g.ch * 2 + 24 },
+    panel: { x: cx - gap * 1.5 - 12, y: 2, w: gap * 3 + 24, h: g.ch * 2 + 54 },
   };
 }
 
-function rankName(v) { return RANK_NAMES[v] || String(v); }
-function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
-function rand(a, b) { return a + Math.random() * (b - a); }
-
-function cardsLeft(p) {
-  const pl = game.players[p];
-  return pl.hand.length + pl.up.filter(Boolean).length + pl.down.filter(Boolean).length;
+// ===== card / ghost elements =====
+function setCardFace(el, id) {
+  el.style.setProperty('--col', String(E.valueOf(id) - 2));
+  el.style.setProperty('--row', String(E.suitOf(id)));
 }
 
-function topValue() {
-  if (!game.pile.length) return 0;
-  return game.pile[game.pile.length - 1].v;
-}
-
-function canPlay(card) {
-  const t = topValue();
-  return t === 0 || card.v === 2 || card.v === 8 || card.v >= t;
-}
-
-// Which zone the player must play from
-function currentZone(p) {
-  const pl = game.players[p];
-  if (pl.hand.length) return 'hand';
-  if (pl.up.some(Boolean)) return 'up';
-  return 'down';
-}
-
-// ===== card elements & layout =====
-function makeCardEl(card) {
-  const el = document.createElement('div');
-  el.className = 'card back';
-  el.style.setProperty('--col', String(card.v - 2));
-  el.style.setProperty('--row', String(card.s));
-  el.dataset.id = card.id;
-  el.addEventListener('click', () => onCardClick(card));
-  cardsLayer.appendChild(el);
-  card.el = el;
+function getCardEl(id, spawnX, spawnY) {
+  let el = cardEls.get(id);
+  if (!el) {
+    el = document.createElement('div');
+    el.className = 'card back notrans';
+    setCardFace(el, id);
+    el.addEventListener('click', () => onCardClick(id));
+    el.style.transform = `translate(${spawnX}px, ${spawnY}px)`;
+    cardsLayer.appendChild(el);
+    cardEls.set(id, el);
+    el.getBoundingClientRect(); // flush so the next transform animates
+    el.classList.remove('notrans');
+  }
   return el;
 }
 
-function place(card, x, y, rot, z, faceUp) {
-  const el = card.el;
-  el.style.transform = `translate(${x}px, ${y}px) rotate(${rot}deg)`;
+function getGhost(key, spawnX, spawnY, onClick) {
+  let el = ghostEls.get(key);
+  if (!el) {
+    el = document.createElement('div');
+    el.className = 'card back notrans';
+    el.dataset.ghost = key;
+    if (onClick) el.addEventListener('click', onClick);
+    el.style.transform = `translate(${spawnX}px, ${spawnY}px)`;
+    cardsLayer.appendChild(el);
+    ghostEls.set(key, el);
+    el.getBoundingClientRect();
+    el.classList.remove('notrans');
+  }
+  return el;
+}
+
+function removeEl(el, fade) {
+  if (fade) {
+    el.classList.add('gone');
+    setTimeout(() => el.remove(), 350);
+  } else el.remove();
+}
+
+function place(el, x, y, rot, z, faceUp, cw, ch) {
+  el.style.setProperty('--cw', (cw || CW) + 'px');
+  el.style.setProperty('--ch', (ch || CH) + 'px');
+  el.style.transform = `translate(${x}px, ${y}px) rotate(${rot || 0}deg)`;
   el.style.zIndex = z;
   el.classList.toggle('back', !faceUp);
 }
 
-function fanPositions(n, cx, spread) {
-  const sp = n > 1 ? Math.min(spread, 560 / (n - 1)) : 0;
-  const xs = [];
-  for (let i = 0; i < n; i++) xs.push(cx - ((n - 1) * sp) / 2 + i * sp - CW / 2);
-  return xs;
+function fanX(i, n, cx, spread, maxW, cw) {
+  const sp = n > 1 ? Math.min(spread, maxW / (n - 1)) : 0;
+  return cx - ((n - 1) * sp) / 2 + i * sp - cw / 2;
 }
 
-function layoutAll() {
-  // deck
-  game.deck.forEach((c, i) => {
-    c.el.classList.remove('gone');
-    place(c, POS.deck.x - CW / 2 - i * 0.15, POS.deck.y - i * 0.2, 0, i, false);
-  });
+// ===== rendering =====
+function sortedHand(cards) {
+  return cards.slice().sort((a, b) => E.valueOf(a) - E.valueOf(b) || E.suitOf(a) - E.suitOf(b));
+}
+
+function spawnPoint() {
+  // where fresh elements appear from when priming a new game
+  return { x: POS.deck.x - CW / 2, y: POS.deck.y };
+}
+
+function render() {
+  if (!view) return;
+  const seen = new Set();      // card ids visible this frame
+  const ghostsSeen = new Set();
+  const sp = spawnPoint();
+
+  // deck ghosts
+  const deckShow = Math.min(view.deckCount, 8);
+  for (let i = 0; i < deckShow; i++) {
+    const key = 'deck-' + i;
+    ghostsSeen.add(key);
+    const el = getGhost(key, sp.x, sp.y);
+    place(el, POS.deck.x - CW / 2 - i * 0.2, POS.deck.y - i * 0.25, 0, 10 + i, false);
+  }
+
   // pile
-  game.pile.forEach((c, i) => {
-    c.el.classList.remove('gone');
-    place(c, POS.pile.x - CW / 2, POS.pile.y, c.jit, 100 + i, true);
+  view.pile.forEach((id, i) => {
+    seen.add(id);
+    if (!(id in jitters)) jitters[id] = Math.random() * 28 - 14;
+    const el = getCardEl(id, sp.x, sp.y);
+    place(el, POS.pile.x - CW / 2, POS.pile.y, jitters[id], 100 + i, true);
+    el.classList.remove('inhand');
   });
-  // burned (fade out at the burn zone)
-  game.burned.forEach((c, i) => {
-    place(c, POS.burn.x - CW / 2, POS.burn.y, c.jit, 1 + i, true);
-    c.el.classList.add('gone');
-  });
+
   // players
-  for (let p = 0; p < 2; p++) {
-    const pl = game.players[p];
-    const hp = POS.hand[p];
-    const xs = fanPositions(pl.hand.length, hp.cx, 58);
-    const mid = (pl.hand.length - 1) / 2;
-    pl.hand.forEach((c, i) => {
-      const d = i - mid;
-      const arc = Math.min(d * d * 0.5, 12);
-      const faceUp = p === 0 && game.phase !== 'setupDown';
-      place(c, xs[i], hp.y + (p === 0 ? arc : -arc), (p === 0 ? 1 : -1) * d * 1.6, 200 + i, faceUp);
-      c.el.classList.toggle('inhand', p === 0);
-    });
-    for (let i = 0; i < 3; i++) {
-      const slotX = POS.slotX[i] - CW / 2;
-      const y = POS.castleY[p];
-      if (pl.down[i]) place(pl.down[i], slotX, y, 0, 50, false);
-      if (pl.up[i]) place(pl.up[i], slotX + 16, y + 3, 0, 60, true); // up cards are public
-    }
-  }
-  updateCounts();
-}
-
-function updateCounts() {
-  $('#deck-count').textContent = game.deck.length ? `Deck · ${game.deck.length}` : 'Deck empty';
-  $('#pile-count').textContent = game.pile.length ? `Pile · ${game.pile.length}` : 'Pile';
-  $('#burn-count').textContent = game.burned.length ? `Burned · ${game.burned.length}` : '';
-  $('#burn-zone').style.opacity = game.burned.length ? 1 : 0.35;
-}
-
-// Highlight what the player can interact with right now
-function refreshInteractivity() {
-  document.querySelectorAll('.card').forEach((el) => el.classList.remove('clickable', 'glow', 'dim'));
-  if (!game || game.phase === 'over') return;
-  const me = game.players[0];
-
-  if (game.phase === 'setupDown') {
-    me.hand.forEach((c) => c.el.classList.add('clickable', 'glow'));
-    return;
-  }
-  if (game.phase === 'setupUp') {
-    me.hand.forEach((c) => c.el.classList.add('clickable', 'glow'));
-    me.up.forEach((c) => { if (c) c.el.classList.add('clickable'); });
-    return;
-  }
-  if (game.phase === 'play' && game.turn === 0 && !busy) {
-    const zone = currentZone(0);
-    if (zone === 'hand') {
-      me.hand.forEach((c) => {
-        c.el.classList.add('clickable');
-        c.el.classList.toggle('glow', canPlay(c));
-        c.el.classList.toggle('dim', !canPlay(c));
-      });
-    } else if (zone === 'up') {
-      me.up.forEach((c) => {
-        if (!c) return;
-        c.el.classList.add('clickable');
-        c.el.classList.toggle('glow', canPlay(c));
-        c.el.classList.toggle('dim', !canPlay(c));
+  for (let s = 0; s < view.n; s++) {
+    const p = view.players[s];
+    const g = seatGeom(s);
+    if (g.me) {
+      const hand = sortedHand(p.hand || []);
+      hand.forEach((id, i) => {
+        seen.add(id);
+        const el = getCardEl(id, sp.x, sp.y);
+        const d = i - (hand.length - 1) / 2;
+        const arc = Math.min(d * d * 0.5, 12);
+        place(el, fanX(i, hand.length, g.handCx, g.handSpread, g.handMax, g.cw), g.handY + arc, d * 1.6, 200 + i, true, g.cw, g.ch);
+        el.classList.add('inhand');
       });
     } else {
-      me.down.forEach((c) => { if (c) c.el.classList.add('clickable', 'glow'); });
+      for (let i = 0; i < p.handCount; i++) {
+        const key = `hand-${s}-${i}`;
+        ghostsSeen.add(key);
+        const el = getGhost(key, sp.x, sp.y);
+        const d = i - (p.handCount - 1) / 2;
+        place(el, fanX(i, p.handCount, g.handCx, g.handSpread, g.handMax, g.cw), g.handY - Math.min(d * d * 0.4, 10), -d * 1.6, 200 + i, false, g.cw, g.ch);
+      }
+    }
+    for (let k = 0; k < 3; k++) {
+      if (p.down[k]) {
+        const key = `down-${s}-${k}`;
+        ghostsSeen.add(key);
+        const el = getGhost(key, sp.x, sp.y, () => onDownClick(s, k));
+        place(el, g.slotX[k] - g.cw / 2, g.castleY, 0, 50, false, g.cw, g.ch);
+      }
+      const upId = p.up[k];
+      if (upId !== null && upId !== undefined) {
+        seen.add(upId);
+        const el = getCardEl(upId, sp.x, sp.y);
+        place(el, g.slotX[k] - g.cw / 2 + g.cw * 0.18, g.castleY + 3, 0, 60, true, g.cw, g.ch);
+        el.classList.remove('inhand');
+      }
+    }
+  }
+
+  // cull vanished elements (burned cards, consumed ghosts)
+  for (const [id, el] of cardEls) {
+    if (!seen.has(id)) { cardEls.delete(id); removeEl(el, true); }
+  }
+  for (const [key, el] of ghostEls) {
+    if (!ghostsSeen.has(key)) { ghostEls.delete(key); removeEl(el, false); }
+  }
+
+  updateLabels();
+  refreshInteractivity();
+}
+
+function updateLabels() {
+  $('#deck-count').textContent = view.deckCount ? `Deck · ${view.deckCount}` : 'Deck empty';
+  $('#pile-count').textContent = view.pile.length ? `Pile · ${view.pile.length}` : 'Pile';
+  $('#burn-count').textContent = view.burnedCount ? `Burned · ${view.burnedCount}` : '';
+  $('#burn-zone').style.opacity = view.burnedCount ? 1 : 0.35;
+
+  for (let s = 0; s < view.n; s++) {
+    const nameEl = document.querySelector(`.seat-name[data-seat="${s}"]`);
+    const panelEl = document.querySelector(`.seat-panel[data-seat="${s}"]`);
+    if (!nameEl) continue;
+    const p = view.players[s];
+    let label = esc(names[s] || `Player ${s + 1}`);
+    if (relIndex(s) === 0) label += ' (you)';
+    let tag = '';
+    if (p.place) tag = ` <span class="tag place-tag">${placeName(p.place, view.n)}</span>`;
+    else if (seatBots[s]) tag = ' <span class="tag">(bot)</span>';
+    else if (seatConn[s] === false) tag = ' <span class="tag">(reconnecting…)</span>';
+    else if (view.phase === 'setup') tag = p.setupDone ? ' <span class="tag">✓ ready</span>' : ' <span class="tag">choosing…</span>';
+    nameEl.innerHTML = label + tag;
+    const active = view.phase === 'play' && view.turn === s;
+    nameEl.classList.toggle('active', active);
+    if (panelEl) panelEl.classList.toggle('active', active);
+  }
+}
+
+function placeName(place, n) {
+  if (place === n) return 'last';
+  return ['1st', '2nd', '3rd', '4th'][place - 1];
+}
+
+// ----- interactivity -----
+function myZone() {
+  const p = view.players[mode.mySeat];
+  if (p.handCount > 0) return 'hand';
+  if (p.up.some((c) => c !== null)) return 'up';
+  return 'down';
+}
+
+function canPlayId(id) {
+  const t = view.pile.length ? E.valueOf(view.pile[view.pile.length - 1]) : 0;
+  const v = E.valueOf(id);
+  return t === 0 || v === 2 || v === 8 || v >= t;
+}
+
+function refreshInteractivity() {
+  document.querySelectorAll('.card').forEach((el) => el.classList.remove('clickable', 'glow', 'dim'));
+  pickupBtn.classList.add('hidden');
+  autoBtn.classList.add('hidden');
+  if (!view || !mode || view.phase === 'over' || pumping) return;
+  const me = view.players[mode.mySeat];
+
+  if (view.phase === 'setup') {
+    if (!me.setupDone) {
+      autoBtn.classList.remove('hidden');
+      for (const id of me.hand) cardEls.get(id)?.classList.add('clickable', 'glow');
+      for (const id of me.up) if (id !== null) cardEls.get(id)?.classList.add('clickable');
+    }
+    return;
+  }
+  if (view.phase !== 'play' || view.turn !== mode.mySeat) return;
+
+  const zone = myZone();
+  if (zone === 'hand' || zone === 'up') {
+    const ids = zone === 'hand' ? me.hand : me.up.filter((c) => c !== null);
+    let any = false;
+    for (const id of ids) {
+      const el = cardEls.get(id);
+      if (!el) continue;
+      el.classList.add('clickable');
+      if (canPlayId(id)) { el.classList.add('glow'); any = true; }
+      else el.classList.add('dim');
+    }
+    if (!any) pickupBtn.classList.remove('hidden');
+  } else {
+    for (let k = 0; k < 3; k++) {
+      if (me.down[k]) ghostEls.get(`down-${mode.mySeat}-${k}`)?.classList.add('clickable', 'glow');
     }
   }
 }
 
-function setTurnLabels() {
-  $('#player-label').classList.toggle('active', game.phase === 'play' && game.turn === 0);
-  $('#ai-label').classList.toggle('active', game.phase === 'play' && game.turn === 1);
-}
-
-// ===== messages =====
+// ===== messages / timer =====
 function msg(text, sticky = false) {
   clearTimeout(msgTimer);
   msgEl.textContent = text;
@@ -234,362 +340,622 @@ function msg(text, sticky = false) {
   if (!sticky) msgTimer = setTimeout(() => msgEl.classList.remove('show'), 2400);
 }
 
-// ===== game flow =====
-async function startGame() {
-  cardsLayer.innerHTML = '';
-  busy = true;
+let timerInterval = null;
+function startTimerDisplay() {
+  stopTimerDisplay();
+  timerInterval = setInterval(() => {
+    if (!mode || mode.kind !== 'online' || !mode.deadline || !view || view.phase !== 'play') {
+      timerEl.textContent = '';
+      return;
+    }
+    const left = Math.max(0, Math.ceil((mode.deadline - Date.now()) / 1000));
+    const who = view.turn === mode.mySeat ? 'Your turn' : `${names[view.turn] || 'Their'} turn`;
+    timerEl.textContent = left <= 20 ? `${who} · ${left}s` : who;
+  }, 250);
+}
+function stopTimerDisplay() {
+  clearInterval(timerInterval);
+  timerEl.textContent = '';
+}
+
+// ===== event playback =====
+function pushView(v, events) {
+  queue.push({ v, events });
+  pump();
+}
+
+async function pump() {
+  if (pumping) return;
+  pumping = true;
+  try {
+    while (queue.length) {
+      const { v, events } = queue.shift();
+      await playback(v, events || []);
+    }
+  } finally {
+    pumping = false;
+    refreshInteractivity();
+  }
+}
+
+function seatOrigin(seat) {
+  const g = seatGeom(seat);
+  return { x: g.handCx - g.cw / 2, y: g.handY };
+}
+
+async function playback(nextView, events) {
+  const prev = view;
+  for (const ev of events) {
+    switch (ev.e) {
+      case 'setUp': case 'unsetUp': {
+        if (ev.seat !== mode.mySeat) sfx('place');
+        break;
+      }
+      case 'start': {
+        view = nextView; render();
+        msg(ev.seat === mode.mySeat ? 'Everyone is ready — you start!' : `Everyone is ready — ${names[ev.seat]} starts`);
+        await sleep(500);
+        break;
+      }
+      case 'played': {
+        const o = seatOrigin(ev.seat);
+        const el = getCardEl(ev.card, o.x, o.y);
+        if (!(ev.card in jitters)) jitters[ev.card] = Math.random() * 28 - 14;
+        setCardFace(el, ev.card);
+        place(el, POS.pile.x - CW / 2, POS.pile.y, jitters[ev.card], 400, true);
+        el.classList.add('pop');
+        setTimeout(() => el.classList.remove('pop'), 320);
+        sfx('place');
+        await sleep(330);
+        break;
+      }
+      case 'burned': {
+        sfx('shove');
+        msg(ev.seat === mode.mySeat ? 'Burn! You go again' : `${names[ev.seat]} burns the pile!`);
+        await sleep(420);
+        break;
+      }
+      case 'reset': {
+        msg(ev.seat === mode.mySeat ? 'Pile reset' : `${names[ev.seat]} resets the pile`);
+        break;
+      }
+      case 'drew': {
+        sfx('slide');
+        await sleep(160);
+        break;
+      }
+      case 'flipped': {
+        // reveal the blind card at its slot before it moves
+        const g = seatGeom(ev.seat);
+        const key = `down-${ev.seat}-${ev.slot}`;
+        const ghost = ghostEls.get(key);
+        if (ghost) { ghostEls.delete(key); ghost.remove(); }
+        const el = getCardEl(ev.card, g.slotX[ev.slot] - g.cw / 2, g.castleY);
+        setCardFace(el, ev.card);
+        place(el, g.slotX[ev.slot] - g.cw / 2, g.castleY, 0, 500, true, g.cw, g.ch);
+        el.classList.add('pop');
+        setTimeout(() => el.classList.remove('pop'), 320);
+        sfx('slide');
+        await sleep(700);
+        if (!ev.ok) {
+          msg(ev.seat === mode.mySeat
+            ? `The ${rankName(E.valueOf(ev.card))} doesn't play — you pick everything up`
+            : `${names[ev.seat]} flips a ${rankName(E.valueOf(ev.card))} — it fails!`);
+        } else if (ev.seat === mode.mySeat) {
+          msg(`Lucky flip — the ${rankName(E.valueOf(ev.card))} plays!`);
+        }
+        break;
+      }
+      case 'pickup': {
+        sfx('fan');
+        if (!ev.flipped) msg(ev.seat === mode.mySeat ? 'You pick up the pile' : `${names[ev.seat]} picks up the pile`);
+        // sweep pile toward the seat
+        const o = seatOrigin(ev.seat);
+        if (prev) for (const id of prev.pile) {
+          const el = cardEls.get(id);
+          if (el) place(el, o.x, o.y, 0, 300, false);
+        }
+        await sleep(420);
+        break;
+      }
+      case 'finished': {
+        msg(ev.seat === mode.mySeat
+          ? `You're out — ${placeName(ev.place, nextView.n)} place!`
+          : `${names[ev.seat]} is out — ${placeName(ev.place, nextView.n)} place`);
+        await sleep(600);
+        break;
+      }
+      case 'turn': break;
+      case 'over': {
+        view = nextView; render();
+        await sleep(700);
+        showOver(ev);
+        break;
+      }
+    }
+  }
+  view = nextView;
+  render();
+}
+
+// ===== game over =====
+function showOver(ev) {
+  stopTimerDisplay();
+  const list = $('#standings');
+  list.innerHTML = '';
+  const medals = ['🥇', '🥈', '🥉', '💀'];
+  for (const st of ev.standings) {
+    const li = document.createElement('li');
+    const isMe = st.seat === mode.mySeat;
+    li.innerHTML = `<span class="medal">${st.place === view.n ? '💀' : medals[st.place - 1]}</span>${esc(names[st.seat] || 'Player')}${isMe ? ' (you)' : ''}`;
+    if (isMe) li.classList.add('me');
+    list.appendChild(li);
+  }
+  const myPlace = ev.standings.find((s) => s.seat === mode.mySeat).place;
+  $('#over-title').textContent = myPlace === 1 ? 'You win! 🏰' : (myPlace < view.n ? 'Well fought' : 'You lose');
+  $('#over-text').textContent = ev.stalemate ? 'Deadlock — nobody could make progress, so fewest cards wins.' : '';
+  $('#again-btn').classList.toggle('hidden', mode.kind !== 'local');
+  $('#rematch-btn').classList.toggle('hidden', !(mode.kind === 'online' && mode.host === mode.mySeat));
+  $('#over-screen').classList.remove('hidden');
+}
+
+// ===== input =====
+function sendAction(a) {
+  if (mode.kind === 'local') {
+    const r = E.applyAction(mode.state, mode.mySeat, a);
+    if (!r.ok) return r;
+    pushView(E.viewFor(mode.state, mode.mySeat), E.censorEvents(r.events, mode.mySeat));
+    runBots();
+    return r;
+  }
+  mode.ws.send(JSON.stringify({ t: 'action', a }));
+  return { ok: true };
+}
+
+function rejectCard(id) {
+  const el = cardEls.get(id);
+  if (el) {
+    el.classList.add('shake');
+    setTimeout(() => el.classList.remove('shake'), 320);
+  }
+  const t = view.pile.length ? E.valueOf(view.pile[view.pile.length - 1]) : 0;
+  msg(`A ${rankName(E.valueOf(id))} can't beat a ${rankName(t)}`);
+}
+
+function onCardClick(id) {
+  if (!mode || !view || pumping) return;
+  const me = view.players[mode.mySeat];
+
+  if (view.phase === 'setup' && !me.setupDone) {
+    if (me.hand.includes(id)) { sfx('place'); sendAction({ type: 'up', card: id }); }
+    else if (me.up.includes(id)) { sfx('slide'); sendAction({ type: 'unup', card: id }); }
+    return;
+  }
+  if (view.phase !== 'play' || view.turn !== mode.mySeat) return;
+  const zone = myZone();
+  if (zone === 'hand' && me.hand.includes(id)) {
+    if (!canPlayId(id)) return rejectCard(id);
+    sendAction({ type: 'play', card: id });
+  } else if (zone === 'up' && me.up.includes(id)) {
+    if (!canPlayId(id)) return rejectCard(id);
+    sendAction({ type: 'play', card: id });
+  }
+}
+
+function onDownClick(seat, slot) {
+  if (!mode || !view || pumping) return;
+  if (seat !== mode.mySeat || view.phase !== 'play' || view.turn !== mode.mySeat) return;
+  if (myZone() !== 'down') return;
+  sendAction({ type: 'flip', slot });
+}
+
+pickupBtn.addEventListener('click', () => {
+  if (!mode || !view || pumping || view.phase !== 'play' || view.turn !== mode.mySeat) return;
+  sendAction({ type: 'pickup' });
+});
+
+autoBtn.addEventListener('click', () => {
+  if (!mode || !view || view.phase !== 'setup') return;
+  const me = view.players[mode.mySeat];
+  if (me.setupDone) return;
+  const need = 3 - me.up.filter((c) => c !== null).length;
+  const score = (id) => { const v = E.valueOf(id); return (v === 2 || v === 8) ? 100 + v : v; };
+  const picks = me.hand.slice().sort((a, b) => score(b) - score(a)).slice(0, need);
+  sfx('place');
+  for (const id of picks) sendAction({ type: 'up', card: id });
+});
+
+// ===== seat furniture (panels, slots, labels) =====
+function buildTable() {
+  $('#panels').innerHTML = '';
+  $('#slots').innerHTML = '';
+  for (let s = 0; s < view.n; s++) {
+    const g = seatGeom(s);
+    if (g.panel) {
+      const div = document.createElement('div');
+      div.className = 'seat-panel';
+      div.dataset.seat = s;
+      Object.assign(div.style, { left: g.panel.x + 'px', top: g.panel.y + 'px', width: g.panel.w + 'px', height: g.panel.h + 'px' });
+      $('#panels').appendChild(div);
+    }
+    const nm = document.createElement('div');
+    nm.className = 'seat-name';
+    nm.dataset.seat = s;
+    nm.style.left = g.nameX + 'px';
+    nm.style.top = g.nameY + 'px';
+    if (g.me) nm.style.transform = 'none';
+    $('#panels').appendChild(nm);
+    for (let k = 0; k < 3; k++) {
+      const slot = document.createElement('div');
+      slot.className = 'castle-slot';
+      Object.assign(slot.style, {
+        left: (g.slotX[k] - g.cw / 2 - 5) + 'px', top: (g.castleY - 5) + 'px',
+        width: (g.cw + 10) + 'px', height: (g.ch + 10) + 'px',
+      });
+      $('#slots').appendChild(slot);
+    }
+  }
+}
+
+function clearTable() {
+  for (const [, el] of cardEls) el.remove();
+  for (const [, el] of ghostEls) el.remove();
+  cardEls.clear();
+  ghostEls.clear();
+  jitters = {};
+  queue = [];
+  $('#panels').innerHTML = '';
+  $('#slots').innerHTML = '';
+  msgEl.classList.remove('show');
+  stopTimerDisplay();
   pickupBtn.classList.add('hidden');
   autoBtn.classList.add('hidden');
-  game = newGame();
-  game.deck.forEach(makeCardEl);
-  layoutAll();
-  setTurnLabels();
+  $('#chat-bar').classList.add('hidden');
+}
+
+// ===== local (practice) mode =====
+let practiceN = 2;
+let botsRunning = false;
+
+function startLocal() {
+  clearTable();
+  const state = E.createGame(practiceN);
+  mode = { kind: 'local', state, mySeat: 0 };
+  names = ['You'];
+  seatBots = [false];
+  seatConn = [true];
+  for (let i = 1; i < practiceN; i++) { names.push(BOT_NAMES[i - 1]); seatBots.push(true); seatConn.push(true); }
+  view = E.viewFor(state, 0);
+  buildTable();
   sfx('shuffle');
-  await sleep(700);
+  render();
+  msg('Choose 3 cards to place face-up on your castle', true);
+  runBots();
+}
 
-  // deal 9 cards each, alternating
-  for (let i = 0; i < 9; i++) {
-    for (const p of [1, 0]) {
-      const c = game.deck.pop();
-      game.players[p].hand.push(c);
-      sfx('slide');
-      layoutAll();
-      await sleep(90);
+async function runBots() {
+  if (botsRunning || !mode || mode.kind !== 'local') return;
+  botsRunning = true;
+  try {
+    for (;;) {
+      const state = mode.state;
+      if (state.phase === 'over') break;
+      let acted = false;
+      for (let s = 1; s < state.n; s++) {
+        const a = E.botAction(state, s);
+        if (!a) continue;
+        await sleep(state.phase === 'setup' ? 350 : 750);
+        if (!mode || mode.kind !== 'local' || mode.state !== state) return;
+        const r = E.applyAction(state, s, a);
+        if (r.ok) pushView(E.viewFor(state, 0), E.censorEvents(r.events, 0));
+        acted = true;
+        break;
+      }
+      if (!acted) break;
     }
+  } finally {
+    botsRunning = false;
   }
-
-  // AI builds its castle immediately (3 random blind, 3 best face-up)
-  aiSetup();
-  layoutAll();
-
-  busy = false;
-  msg('Pick 3 cards for your face-down castle', true);
-  autoBtn.classList.remove('hidden');
-  refreshInteractivity();
 }
 
-function bestSetupCards(cards, n) {
-  // Prefer magic cards (2, 8), then highest values
-  return [...cards]
-    .sort((a, b) => score(b) - score(a))
-    .slice(0, n);
-  function score(c) { return (c.v === 2 || c.v === 8) ? 100 + c.v : c.v; }
+// ===== online mode =====
+// resolution order: explicit ?server= override (handy for dev/testing),
+// then the deployed config.js value, then a localhost fallback for development
+const SERVER_URL = new URLSearchParams(location.search).get('server')
+  || (window.CASTLES_SERVER && window.CASTLES_SERVER.trim())
+  || (['localhost', '127.0.0.1'].includes(location.hostname) ? 'ws://localhost:8902' : '');
+
+function setOnlineStatus(text, ok) {
+  const el = $('#online-status');
+  el.textContent = text || '';
+  el.classList.toggle('ok', !!ok);
 }
 
-function aiSetup() {
-  const ai = game.players[1];
-  for (let i = 0; i < 3; i++) {
-    const k = Math.floor(Math.random() * ai.hand.length);
-    ai.down[i] = ai.hand.splice(k, 1)[0];
+function saveSession(data) {
+  try { sessionStorage.setItem('castles-room', JSON.stringify({ ...data, at: Date.now() })); } catch (e) {}
+}
+function loadSession() {
+  try {
+    const d = JSON.parse(sessionStorage.getItem('castles-room'));
+    if (d && Date.now() - d.at < 2 * 3600 * 1000) return d;
+  } catch (e) {}
+  return null;
+}
+function clearSession() {
+  try { sessionStorage.removeItem('castles-room'); } catch (e) {}
+}
+
+function connect(onOpen) {
+  if (!SERVER_URL) {
+    setOnlineStatus('Online play is not configured for this build.');
+    return null;
   }
-  const ups = bestSetupCards(ai.hand, 3);
-  ups.forEach((c, i) => {
-    ai.up[i] = c;
-    ai.hand.splice(ai.hand.indexOf(c), 1);
+  let ws;
+  try { ws = new WebSocket(SERVER_URL); } catch (e) {
+    setOnlineStatus('Could not reach the game server.');
+    return null;
+  }
+  ws.addEventListener('open', () => onOpen(ws));
+  ws.addEventListener('message', (m) => onServerMessage(ws, m));
+  ws.addEventListener('close', () => onSocketClose(ws));
+  ws.addEventListener('error', () => {});
+  return ws;
+}
+
+function onServerMessage(ws, m) {
+  let d;
+  try { d = JSON.parse(m.data); } catch (e) { return; }
+
+  if (d.t === 'error') {
+    setOnlineStatus(d.msg);
+    if (mode && mode.kind === 'online' && view) msg(d.msg);
+    return;
+  }
+  if (d.t === 'room') {
+    // seat/token assignment or lobby update
+    if (!mode || mode.kind !== 'online' || mode.ws !== ws) {
+      mode = { kind: 'online', ws, mySeat: d.seat, code: d.code, token: d.token, host: d.host, deadline: 0 };
+    }
+    mode.mySeat = d.seat !== undefined ? d.seat : mode.mySeat;
+    mode.host = d.host;
+    if (d.token) mode.token = d.token;
+    names = d.players.map((p) => p.name);
+    seatBots = d.players.map((p) => !!p.bot);
+    seatConn = d.players.map((p) => !!p.connected);
+    saveSession({ code: d.code, token: mode.token, name: names[mode.mySeat] });
+    if (!d.started) {
+      showLobby(d);
+    } else if (view) {
+      updateLabels();
+    }
+    return;
+  }
+  if (d.t === 'state') {
+    hideAllOverlays();
+    $('#chat-bar').classList.remove('hidden');
+    mode.deadline = d.deadlineMs ? Date.now() + d.deadlineMs : 0;
+    if (!view || d.view.phase === 'setup' && view.phase === 'over') {
+      // fresh game (first state or rematch)
+      clearTableSoft();
+      view = d.view;
+      buildTable();
+      sfx('shuffle');
+      render();
+      if (view.phase === 'setup') msg('Choose 3 cards to place face-up on your castle', true);
+      startTimerDisplay();
+      pushView(d.view, []);
+    } else {
+      pushView(d.view, d.events || []);
+    }
+    return;
+  }
+  if (d.t === 'chat') {
+    showBubble(d.seat, CHAT_PHRASES[d.i] || '…');
+    return;
+  }
+  if (d.t === 'gone') {
+    msg('The room was closed');
+    leaveToTitle();
+  }
+}
+
+function clearTableSoft() {
+  for (const [, el] of cardEls) el.remove();
+  for (const [, el] of ghostEls) el.remove();
+  cardEls.clear();
+  ghostEls.clear();
+  jitters = {};
+  queue = [];
+}
+
+let reconnectTries = 0;
+function onSocketClose(ws) {
+  if (!mode || mode.kind !== 'online' || mode.ws !== ws) return;
+  if (!view) {
+    // lost connection in lobby
+    showScreen('online');
+    setOnlineStatus('Connection lost.');
+    mode = null;
+    return;
+  }
+  if (view.phase === 'over') { return; }
+  $('#reconnect-screen').classList.remove('hidden');
+  attemptRejoin();
+}
+
+async function attemptRejoin() {
+  const sess = loadSession();
+  if (!sess) { leaveToTitle(); return; }
+  reconnectTries = 0;
+  const tryOnce = () => {
+    if (!$('#reconnect-screen') || $('#reconnect-screen').classList.contains('hidden')) return;
+    if (++reconnectTries > 15) {
+      $('#reconnect-status').textContent = 'Could not reconnect.';
+      return;
+    }
+    $('#reconnect-status').textContent = `Trying to reconnect… (${reconnectTries})`;
+    const ws = connect((ws) => {
+      ws.send(JSON.stringify({ t: 'rejoin', code: sess.code, token: sess.token }));
+    });
+    if (!ws) return;
+    ws.addEventListener('message', function onMsg(m) {
+      let d;
+      try { d = JSON.parse(m.data); } catch (e) { return; }
+      if (d.t === 'room') {
+        mode = { kind: 'online', ws, mySeat: d.seat, code: d.code, token: sess.token, host: d.host, deadline: 0 };
+        $('#reconnect-screen').classList.add('hidden');
+        view = null; // full state will arrive next
+        ws.removeEventListener('message', onMsg);
+      } else if (d.t === 'error') {
+        ws.close();
+      }
+    });
+    ws.addEventListener('close', () => setTimeout(tryOnce, 2500));
+  };
+  tryOnce();
+}
+
+function showBubble(seat, text) {
+  const g = seatGeom(seat);
+  const b = document.createElement('div');
+  b.className = 'bubble';
+  b.textContent = text;
+  b.style.left = g.bubble.x + 'px';
+  b.style.top = g.bubble.y + 'px';
+  $('#bubbles').appendChild(b);
+  setTimeout(() => b.classList.add('fade'), 2100);
+  setTimeout(() => b.remove(), 2600);
+}
+
+let lastChat = 0;
+document.querySelectorAll('.btn-chat').forEach((btn) => {
+  btn.addEventListener('click', () => {
+    if (!mode || mode.kind !== 'online') return;
+    if (Date.now() - lastChat < 1500) return;
+    lastChat = Date.now();
+    mode.ws.send(JSON.stringify({ t: 'chat', i: +btn.dataset.chat }));
+    showBubble(mode.mySeat, CHAT_PHRASES[+btn.dataset.chat]);
   });
-}
+});
 
-function placeSetupCard(card) {
-  const me = game.players[0];
-  const zone = game.phase === 'setupDown' ? me.down : me.up;
-  const slot = zone.indexOf(null);
-  if (slot === -1) return;
-  me.hand.splice(me.hand.indexOf(card), 1);
-  zone[slot] = card;
-  sfx('place');
-  card.el.classList.add('pop');
-  setTimeout(() => card.el.classList.remove('pop'), 320);
-  layoutAll();
-
-  if (game.phase === 'setupDown' && !zone.includes(null)) {
-    game.phase = 'setupUp';
-    layoutAll(); // reveals remaining hand
-    msg('Now pick 3 cards to place face-up on top', true);
-  } else if (game.phase === 'setupUp' && !zone.includes(null)) {
-    beginPlay();
-    return;
+// ===== screens =====
+function showScreen(name) {
+  for (const id of ['title-screen', 'online-screen', 'lobby-screen', 'rules-screen', 'over-screen', 'reconnect-screen']) {
+    $('#' + id).classList.toggle('hidden', id !== name + '-screen');
   }
-  refreshInteractivity();
 }
-
-function returnUpCard(card) {
-  const me = game.players[0];
-  const i = me.up.indexOf(card);
-  if (i === -1) return;
-  me.up[i] = null;
-  me.hand.push(card);
-  sfx('slide');
-  layoutAll();
-  refreshInteractivity();
-}
-
-async function beginPlay() {
-  game.phase = 'play';
-  autoBtn.classList.add('hidden');
-  busy = true;
-  refreshInteractivity();
-  layoutAll();
-  await sleep(400);
-  game.turn = Math.random() < 0.5 ? 0 : 1;
-  setTurnLabels();
-  if (game.turn === 0) {
-    msg('You start!');
-    playerTurnStart();
-  } else {
-    msg('Opponent starts');
-    aiTurn();
+function hideAllOverlays() {
+  for (const id of ['title-screen', 'online-screen', 'lobby-screen', 'over-screen', 'reconnect-screen']) {
+    $('#' + id).classList.add('hidden');
   }
 }
 
-function playerTurnStart(extraMsg) {
-  game.turn = 0;
-  busy = false;
-  setTurnLabels();
-  const zone = currentZone(0);
-  const me = game.players[0];
-  let stuck = false;
-  if (zone === 'hand') stuck = !me.hand.some(canPlay);
-  else if (zone === 'up') stuck = !me.up.filter(Boolean).some(canPlay);
-  if (stuck) {
-    msg(extraMsg || 'No playable card — you must pick up the pile', true);
-    pickupBtn.classList.remove('hidden');
-  } else {
-    pickupBtn.classList.add('hidden');
-    if (extraMsg) msg(extraMsg);
+function showLobby(d) {
+  showScreen('lobby');
+  $('#lobby-code').textContent = d.code;
+  const ul = $('#lobby-players');
+  ul.innerHTML = '';
+  d.players.forEach((p, s) => {
+    const li = document.createElement('li');
+    li.innerHTML = `${esc(p.name)}${s === mode.mySeat ? ' <span class="you">(you)</span>' : ''}${p.connected ? '' : ' <span class="off">— disconnected</span>'}`;
+    ul.appendChild(li);
+  });
+  const isHost = mode.host === mode.mySeat;
+  $('#start-btn').classList.toggle('hidden', !isHost);
+  $('#start-btn').disabled = d.players.length < 2;
+  $('#lobby-status').textContent = isHost
+    ? (d.players.length < 2 ? 'Waiting for at least one more player…' : 'Ready when you are!')
+    : `Waiting for ${names[mode.host] || 'the host'} to start…`;
+  $('#lobby-status').classList.add('ok');
+  // invite links only make sense outside an iframe (itch.io doesn't forward them)
+  $('#link-wrap').classList.toggle('hidden', window.top !== window.self);
+}
+
+function leaveToTitle() {
+  if (mode && mode.kind === 'online' && mode.ws) {
+    try { mode.ws.close(); } catch (e) {}
   }
-  refreshInteractivity();
+  clearSession();
+  mode = null;
+  view = null;
+  clearTable();
+  showScreen('title');
 }
 
-async function doPlay(p, card, fromZone) {
-  busy = true;
-  pickupBtn.classList.add('hidden');
-  refreshInteractivity();
-  const pl = game.players[p];
+// ----- ui wiring -----
+document.querySelectorAll('.btn-count').forEach((btn) => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.btn-count').forEach((b) => b.classList.remove('sel'));
+    btn.classList.add('sel');
+    practiceN = +btn.dataset.count;
+  });
+});
 
-  if (fromZone === 'hand') pl.hand.splice(pl.hand.indexOf(card), 1);
-  else if (fromZone === 'up') pl.up[pl.up.indexOf(card)] = null;
-  else pl.down[pl.down.indexOf(card)] = null;
-
-  card.jit = rand(-14, 14);
-  game.pile.push(card);
-  sfx('place');
-  card.el.classList.add('pop');
-  setTimeout(() => card.el.classList.remove('pop'), 320);
-  layoutAll();
-  await sleep(320);
-
-  let burned = false;
-  if (card.v === 8) {
-    await sleep(240);
-    game.burned.push(...game.pile);
-    game.pile.length = 0;
-    sfx('shove');
-    msg(p === 0 ? 'Burn! You go again' : 'Opponent burns the pile!');
-    layoutAll();
-    await sleep(350);
-    burned = true;
-  } else if (card.v === 2) {
-    msg('Pile reset');
-  }
-
-  // refill hand to 3 while the deck lasts
-  if (fromZone === 'hand') {
-    while (pl.hand.length < 3 && game.deck.length) {
-      pl.hand.push(game.deck.pop());
-      sfx('slide');
-      layoutAll();
-      await sleep(140);
-    }
-  }
-
-  if (cardsLeft(p) === 0) { gameOver(p); return 'over'; }
-  return burned ? 'again' : 'next';
-}
-
-async function pickupPile(p) {
-  busy = true;
-  pickupBtn.classList.add('hidden');
-  const pl = game.players[p];
-  sfx('fan');
-  msg(p === 0 ? 'You pick up the pile' : 'Opponent picks up the pile');
-  pl.hand.push(...game.pile);
-  game.pile.length = 0;
-  layoutAll();
-  refreshInteractivity();
-  await sleep(550);
-}
-
-async function onCardClick(card) {
-  if (!game || busy) return;
-
-  if (game.phase === 'setupDown') {
-    if (game.players[0].hand.includes(card)) placeSetupCard(card);
-    return;
-  }
-  if (game.phase === 'setupUp') {
-    if (game.players[0].hand.includes(card)) placeSetupCard(card);
-    else if (game.players[0].up.includes(card)) returnUpCard(card);
-    return;
-  }
-  if (game.phase !== 'play' || game.turn !== 0) return;
-
-  const me = game.players[0];
-  const zone = currentZone(0);
-
-  if (zone === 'hand' && me.hand.includes(card)) {
-    if (!canPlay(card)) return rejectCard(card);
-    const r = await doPlay(0, card, 'hand');
-    afterPlayerAction(r);
-  } else if (zone === 'up' && me.up.includes(card)) {
-    if (!canPlay(card)) return rejectCard(card);
-    const r = await doPlay(0, card, 'up');
-    afterPlayerAction(r);
-  } else if (zone === 'down' && me.down.includes(card)) {
-    await blindFlip(0, card);
-  }
-}
-
-function rejectCard(card) {
-  card.el.classList.add('shake');
-  setTimeout(() => card.el.classList.remove('shake'), 320);
-  msg(`A ${rankName(card.v)} can't beat a ${rankName(topValue())}`);
-}
-
-async function blindFlip(p, card) {
-  busy = true;
-  refreshInteractivity();
-  const pl = game.players[p];
-  card.el.classList.remove('back');
-  card.el.classList.add('pop');
-  setTimeout(() => card.el.classList.remove('pop'), 320);
-  sfx('slide');
-  await sleep(650);
-  if (canPlay(card)) {
-    msg(p === 0 ? `Lucky flip — ${rankName(card.v)} plays!` : `Opponent flips a ${rankName(card.v)} — it plays`);
-    const r = await doPlay(p, card, 'down');
-    if (p === 0) afterPlayerAction(r); else return r;
-  } else {
-    // failed blind flip: pick up pile plus the flipped card
-    msg(p === 0
-      ? `The ${rankName(card.v)} doesn't beat a ${rankName(topValue())} — you pick everything up`
-      : `Opponent's ${rankName(card.v)} fails — they pick everything up`);
-    pl.down[pl.down.indexOf(card)] = null;
-    pl.hand.push(card);
-    pl.hand.push(...game.pile);
-    game.pile.length = 0;
-    sfx('fan');
-    layoutAll();
-    await sleep(650);
-    if (p === 0) afterPlayerAction('next'); else return 'next';
-  }
-  return 'next';
-}
-
-function afterPlayerAction(result) {
-  if (result === 'over') return;
-  if (result === 'again') { playerTurnStart('You go again!'); return; }
-  aiTurn();
-}
-
-// ===== AI =====
-function aiPick(cands) {
-  const normals = cands.filter((c) => c.v !== 2 && c.v !== 8).sort((a, b) => a.v - b.v);
-  if (normals.length) return normals[0];
-  const eights = cands.filter((c) => c.v === 8);
-  const twos = cands.filter((c) => c.v === 2);
-  if (game.pile.length >= 4 && eights.length) return eights[0];
-  return twos[0] || eights[0];
-}
-
-async function aiTurn() {
-  game.turn = 1;
-  busy = true;
-  setTurnLabels();
-  refreshInteractivity();
-  const ai = game.players[1];
-
-  for (;;) {
-    await sleep(650);
-    if (game.phase !== 'play') return;
-    const zone = currentZone(1);
-
-    if (zone === 'down') {
-      const options = ai.down.filter(Boolean);
-      const card = options[Math.floor(Math.random() * options.length)];
-      const r = await blindFlip(1, card);
-      if (game.phase !== 'play') return;
-      if (r === 'again' && cardsLeft(1) > 0) continue;
-      break;
-    }
-
-    const cards = zone === 'hand' ? ai.hand : ai.up.filter(Boolean);
-    const cands = cards.filter(canPlay);
-    if (!cands.length) { await pickupPile(1); break; }
-
-    const card = aiPick(cands);
-    const r = await doPlay(1, card, zone);
-    if (r === 'over') return;
-    if (r === 'again') continue;
-    break;
-  }
-  playerTurnStart();
-}
-
-// ===== win / lose =====
-function gameOver(winner) {
-  game.phase = 'over';
-  busy = true;
-  setTurnLabels();
-  refreshInteractivity();
-  pickupBtn.classList.add('hidden');
-  const you = winner === 0;
-  $('#over-title').textContent = you ? 'You win! 🏰' : 'You lose';
-  $('#over-text').textContent = you
-    ? 'Your castle stands — every card shed. Well played!'
-    : `The opponent shed everything first. You still held ${cardsLeft(0)} card${cardsLeft(0) === 1 ? '' : 's'}.`;
-  setTimeout(() => $('#over-screen').classList.remove('hidden'), 900);
-}
-
-// ===== setup auto-place =====
-function autoPlace() {
-  if (!game || busy) return;
-  const me = game.players[0];
-  if (game.phase === 'setupDown') {
-    while (me.down.includes(null)) {
-      placeSetupCard(me.hand[Math.floor(Math.random() * me.hand.length)]);
-    }
-  } else if (game.phase === 'setupUp') {
-    const picks = bestSetupCards(me.hand, 3 - me.up.filter(Boolean).length);
-    for (const c of picks) {
-      if (game.phase !== 'setupUp') break;
-      placeSetupCard(c);
-    }
-  }
-}
-
-// ===== ui wiring =====
-$('#play-btn').addEventListener('click', () => {
-  $('#title-screen').classList.add('hidden');
-  startGame();
+$('#practice-btn').addEventListener('click', () => { hideAllOverlays(); startLocal(); });
+$('#online-btn').addEventListener('click', () => {
+  showScreen('online');
+  setOnlineStatus(SERVER_URL ? '' : 'Online play is not configured for this build.');
+  $('#rejoin-btn').classList.toggle('hidden', !loadSession());
+  $('#name-input').value = localStorage.getItem('castles-name') || '';
 });
 $('#rules-btn').addEventListener('click', () => $('#rules-screen').classList.remove('hidden'));
 $('#help-btn').addEventListener('click', () => $('#rules-screen').classList.remove('hidden'));
-$('#rules-close-btn').addEventListener('click', () => $('#rules-screen').classList.add('hidden'));
-$('#again-btn').addEventListener('click', () => {
-  $('#over-screen').classList.add('hidden');
-  startGame();
+$('#rules-close-btn').addEventListener('click', () => {
+  $('#rules-screen').classList.add('hidden');
+  if (!mode) showScreen('title');
 });
-$('#restart-btn').addEventListener('click', () => {
-  if (game && game.phase !== 'over') sfx('shuffle');
-  $('#over-screen').classList.add('hidden');
-  startGame();
+$('#online-back-btn').addEventListener('click', () => showScreen('title'));
+
+function myName() {
+  const v = $('#name-input').value.trim().slice(0, 14);
+  if (!v) { setOnlineStatus('Enter a name first.'); return null; }
+  localStorage.setItem('castles-name', v);
+  return v;
+}
+
+$('#create-btn').addEventListener('click', () => {
+  const name = myName();
+  if (!name) return;
+  setOnlineStatus('Connecting…', true);
+  connect((ws) => ws.send(JSON.stringify({ t: 'create', name })));
 });
-pickupBtn.addEventListener('click', async () => {
-  if (!game || game.phase !== 'play' || game.turn !== 0 || busy) return;
-  await pickupPile(0);
-  aiTurn();
+$('#join-btn').addEventListener('click', joinRoom);
+$('#code-input').addEventListener('keydown', (e) => { if (e.key === 'Enter') joinRoom(); });
+function joinRoom() {
+  const name = myName();
+  if (!name) return;
+  const code = $('#code-input').value.trim().toUpperCase();
+  if (code.length !== 4) { setOnlineStatus('Room codes are 4 letters.'); return; }
+  setOnlineStatus('Connecting…', true);
+  connect((ws) => ws.send(JSON.stringify({ t: 'join', code, name })));
+}
+$('#rejoin-btn').addEventListener('click', () => {
+  const sess = loadSession();
+  if (!sess) return;
+  setOnlineStatus('Rejoining…', true);
+  connect((ws) => ws.send(JSON.stringify({ t: 'rejoin', code: sess.code, token: sess.token })));
 });
-autoBtn.addEventListener('click', autoPlace);
+
+$('#start-btn').addEventListener('click', () => {
+  if (mode && mode.kind === 'online') mode.ws.send(JSON.stringify({ t: 'start' }));
+});
+$('#lobby-leave-btn').addEventListener('click', leaveToTitle);
+$('#copy-link').addEventListener('click', (e) => {
+  e.preventDefault();
+  const url = `${location.origin}${location.pathname}?room=${mode ? mode.code : ''}`;
+  navigator.clipboard?.writeText(url).then(
+    () => { $('#lobby-status').textContent = 'Link copied!'; },
+    () => { $('#lobby-status').textContent = url; },
+  );
+});
+
+$('#again-btn').addEventListener('click', () => { $('#over-screen').classList.add('hidden'); startLocal(); });
+$('#rematch-btn').addEventListener('click', () => {
+  if (mode && mode.kind === 'online') mode.ws.send(JSON.stringify({ t: 'rematch' }));
+});
+$('#over-leave-btn').addEventListener('click', leaveToTitle);
+$('#reconnect-leave-btn').addEventListener('click', leaveToTitle);
+$('#leave-btn').addEventListener('click', leaveToTitle);
 
 const muteBtn = $('#mute-btn');
 function renderMute() { muteBtn.innerHTML = muted ? '&#128263;' : '&#128266;'; }
@@ -600,29 +966,23 @@ muteBtn.addEventListener('click', () => {
 });
 renderMute();
 
-// position table zones from the same constants the cards use
+// ===== static zone positioning & scaling =====
 function positionZones() {
   const set = (el, x, y) => { el.style.left = `${x - CW / 2 - 5}px`; el.style.top = `${y - 5}px`; };
   set($('#deck-zone'), POS.deck.x, POS.deck.y);
   set($('#pile-zone'), POS.pile.x, POS.pile.y);
   set($('#burn-zone'), POS.burn.x, POS.burn.y);
-  document.querySelectorAll('.castle-slot').forEach((el) => {
-    set(el, POS.slotX[+el.dataset.slot], POS.castleY[+el.dataset.owner]);
-  });
-  const msgP = POS.msg;
-  msgEl.style.left = `${msgP.x}px`;
-  msgEl.style.top = `${msgP.y}px`;
+  msgEl.style.left = POS.msg.x + 'px';
+  msgEl.style.top = POS.msg.y + 'px';
   msgEl.style.transform = 'translateX(-50%)';
-  pickupBtn.style.left = `${POS.pickup.x}px`;
-  pickupBtn.style.top = `${POS.pickup.y}px`;
+  timerEl.style.left = POS.timer.x + 'px';
+  timerEl.style.top = POS.timer.y + 'px';
+  timerEl.style.transform = 'translateX(-50%)';
+  pickupBtn.style.left = POS.pickup.x + 'px';
+  pickupBtn.style.top = POS.pickup.y + 'px';
   pickupBtn.style.transform = 'translateX(-50%)';
-  $('#ai-label').style.left = '40px';
-  $('#ai-label').style.top = '40px';
-  $('#player-label').style.left = '40px';
-  $('#player-label').style.top = `${H - 60}px`;
 }
 
-// scale the fixed 1280x720 stage to the window
 function rescale() {
   const s = Math.min(window.innerWidth / W, window.innerHeight / H);
   stage.style.transform = `translate(${-W * s / 2}px, ${-H * s / 2}px) scale(${s})`;
@@ -631,9 +991,21 @@ window.addEventListener('resize', rescale);
 positionZones();
 rescale();
 
+// deep link: ?room=CODE opens the join screen with the code prefilled
+const roomParam = new URLSearchParams(location.search).get('room');
+if (roomParam && roomParam.length === 4) {
+  showScreen('online');
+  $('#code-input').value = roomParam.toUpperCase();
+  $('#name-input').value = localStorage.getItem('castles-name') || '';
+  setOnlineStatus(SERVER_URL ? 'Enter your name and hit Join!' : 'Online play is not configured for this build.', true);
+}
+
 // test hook (used by automated browser tests; harmless in production)
 window.__castles = {
-  get game() { return game; },
-  get busy() { return busy; },
-  canPlay, currentZone, cardsLeft, topValue,
+  get mode() { return mode; },
+  get view() { return view; },
+  get pumping() { return pumping; },
+  get cardEls() { return cardEls; },
+  get ghostEls() { return ghostEls; },
+  engine: E,
 };

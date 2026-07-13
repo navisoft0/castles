@@ -5,3 +5,6 @@
 .export/
 .godot/
 *.log
+
+# Node
+node_modules/
