@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Castles — Jake's Way</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%8F%B0%3C/text%3E%3C/svg%3E">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div id="viewport">
+  <div id="stage">
+    <div id="table">
+      <!-- opponent area -->
+      <div class="seat-label" id="ai-label">Opponent</div>
+      <div class="castle-slot" data-owner="1" data-slot="0"></div>
+      <div class="castle-slot" data-owner="1" data-slot="1"></div>
+      <div class="castle-slot" data-owner="1" data-slot="2"></div>
+
+      <!-- center -->
+      <div id="deck-zone"><span class="zone-label" id="deck-count"></span></div>
+      <div id="pile-zone"><span class="zone-label" id="pile-count"></span></div>
+      <div id="burn-zone"><span class="zone-label" id="burn-count"></span></div>
+
+      <!-- player area -->
+      <div class="castle-slot" data-owner="0" data-slot="0"></div>
+      <div class="castle-slot" data-owner="0" data-slot="1"></div>
+      <div class="castle-slot" data-owner="0" data-slot="2"></div>
+      <div class="seat-label" id="player-label">You</div>
+
+      <div id="cards"></div>
+
+      <div id="message"></div>
+      <button id="pickup-btn" class="btn btn-danger hidden">Pick up pile</button>
+      <button id="auto-btn" class="btn hidden">Auto-place</button>
+
+      <div id="hud">
+        <button id="mute-btn" class="btn btn-icon" title="Sound on/off">&#128266;</button>
+        <button id="help-btn" class="btn btn-icon" title="How to play">?</button>
+        <button id="restart-btn" class="btn btn-icon" title="Restart">&#8635;</button>
+      </div>
+    </div>
+
+    <!-- title screen -->
+    <div id="title-screen" class="overlay">
+      <div class="panel">
+        <h1>Castles</h1>
+        <p class="subtitle">Jake's Way</p>
+        <p class="blurb">Build your castle, then race the opponent to shed every card.
+        Equal or higher beats the pile &mdash; <b>2</b> resets it, <b>8</b> burns it.</p>
+        <button id="play-btn" class="btn btn-big">Play</button>
+        <button id="rules-btn" class="btn">How to play</button>
+      </div>
+    </div>
+
+    <!-- rules screen -->
+    <div id="rules-screen" class="overlay hidden">
+      <div class="panel panel-wide">
+        <h2>How to play</h2>
+        <div class="rules-text">
+          <p><b>Setup.</b> You're dealt 9 cards. First pick <b>3 face-down</b> cards for your castle (blind!), then look at the rest and pick <b>3 face-up</b> cards to place on top of them. The last 3 are your hand.</p>
+          <p><b>Play.</b> Take turns playing one card onto the pile. A card must be of <b>equal or higher</b> value than the top card. Aces are high.</p>
+          <p><b>Magic cards.</b> A <b>2</b> can be played on anything and resets the pile. An <b>8</b> can be played on anything, <b>burns</b> the whole pile out of the game &mdash; and you go again.</p>
+          <p><b>Stuck?</b> If you can't play, you pick up the whole pile into your hand.</p>
+          <p><b>Draw.</b> While the deck lasts, refill your hand to 3 cards after you play.</p>
+          <p><b>The castle.</b> Once your hand and the deck are empty, play your face-up castle cards. After those, flip your face-down cards blind &mdash; if one doesn't beat the pile, you pick everything up!</p>
+          <p><b>Win.</b> First player with no cards left wins.</p>
+        </div>
+        <button id="rules-close-btn" class="btn btn-big">Got it</button>
+      </div>
+    </div>
+
+    <!-- game over screen -->
+    <div id="over-screen" class="overlay hidden">
+      <div class="panel">
+        <h1 id="over-title">You win!</h1>
+        <p id="over-text" class="blurb"></p>
+        <button id="again-btn" class="btn btn-big">Play again</button>
+      </div>
+    </div>
+  </div>
+</div>
+<script src="game.js"></script>
+</body>
+</html>

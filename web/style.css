@@ -1,0 +1,259 @@
+/* Castles — Jake's Way. Layout is a fixed 1280x720 stage scaled to fit. */
+
+:root {
+  --cw: 88px;   /* card width  */
+  --ch: 120px;  /* card height */
+  --felt-1: #2c7a44;
+  --felt-2: #174d29;
+  --gold: #ffd977;
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+html, body {
+  width: 100%; height: 100%;
+  overflow: hidden;
+  background: #0d2415;
+  font-family: "Trebuchet MS", "Segoe UI", Verdana, sans-serif;
+  touch-action: manipulation;
+  -webkit-user-select: none; user-select: none;
+  -webkit-tap-highlight-color: transparent;
+}
+
+#viewport { position: fixed; inset: 0; }
+
+#stage {
+  position: absolute;
+  left: 50%; top: 50%;
+  width: 1280px; height: 720px;
+  transform-origin: 0 0;   /* scale set from JS */
+}
+
+#table {
+  position: absolute; inset: 0;
+  background:
+    radial-gradient(ellipse 90% 80% at 50% 45%, var(--felt-1) 0%, var(--felt-2) 75%, #0f3319 100%);
+  border-radius: 18px;
+  box-shadow: inset 0 0 120px rgba(0,0,0,.45);
+  overflow: hidden;
+}
+
+/* ---------- cards ---------- */
+
+.card {
+  position: absolute;
+  left: 0; top: 0;
+  width: var(--cw); height: var(--ch);
+  background-image: url("assets/cards.png");
+  background-size: calc(var(--cw) * 13) calc(var(--ch) * 5);
+  background-position: calc(var(--col, 0) * var(--cw) * -1) calc(var(--row, 0) * var(--ch) * -1);
+  border-radius: 6px;
+  box-shadow: 0 2px 5px rgba(0,0,0,.35);
+  transition: transform .28s cubic-bezier(.22,.9,.35,1.1), opacity .3s ease;
+  will-change: transform;
+  cursor: default;
+}
+
+.card.back { background-position: 0 calc(var(--ch) * -4); }
+
+.card.clickable { cursor: pointer; }
+
+.card.inhand.clickable:hover { margin-top: -14px; }
+
+.card.glow {
+  box-shadow: 0 0 0 3px var(--gold), 0 0 18px 4px rgba(255,217,119,.55);
+}
+
+.card.dim { filter: brightness(.82); }
+
+.card.gone { opacity: 0; pointer-events: none; }
+
+.card.pop { animation: pop .3s ease; }
+@keyframes pop {
+  0%   { filter: brightness(1.9); }
+  100% { filter: brightness(1); }
+}
+
+.card.shake { animation: shake .3s ease; }
+@keyframes shake {
+  0%, 100% { margin-left: 0; }
+  25% { margin-left: -7px; }
+  75% { margin-left: 7px; }
+}
+
+/* ---------- table zones ---------- */
+
+.castle-slot {
+  position: absolute;
+  width: calc(var(--cw) + 10px); height: calc(var(--ch) + 10px);
+  border: 2px dashed rgba(255,255,255,.28);
+  border-radius: 9px;
+}
+
+#deck-zone, #pile-zone, #burn-zone {
+  position: absolute;
+  width: calc(var(--cw) + 10px); height: calc(var(--ch) + 10px);
+  border: 2px dashed rgba(255,255,255,.22);
+  border-radius: 9px;
+}
+
+.zone-label {
+  position: absolute;
+  left: 50%; bottom: -26px;
+  transform: translateX(-50%);
+  color: rgba(255,255,255,.75);
+  font-size: 15px;
+  white-space: nowrap;
+  text-shadow: 0 1px 2px rgba(0,0,0,.6);
+}
+
+.seat-label {
+  position: absolute;
+  color: rgba(255,255,255,.55);
+  font-size: 16px;
+  letter-spacing: 2px;
+  text-transform: uppercase;
+  text-shadow: 0 1px 2px rgba(0,0,0,.6);
+}
+.seat-label.active { color: var(--gold); text-shadow: 0 0 10px rgba(255,217,119,.7); }
+
+#message {
+  position: absolute;
+  left: 50%; top: 348px;
+  transform: translateX(-50%);
+  min-width: 240px;
+  max-width: 420px;
+  padding: 8px 22px;
+  text-align: center;
+  color: #fff;
+  font-size: 21px;
+  font-weight: bold;
+  text-shadow: 0 2px 4px rgba(0,0,0,.7);
+  background: rgba(0,0,0,.28);
+  border-radius: 24px;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity .25s ease;
+  z-index: 900;
+}
+#message.show { opacity: 1; }
+
+/* ---------- buttons / HUD ---------- */
+
+.btn {
+  font-family: inherit;
+  font-size: 19px;
+  font-weight: bold;
+  color: #fff;
+  background: linear-gradient(#3f9e60, #2b7043);
+  border: 2px solid rgba(255,255,255,.35);
+  border-radius: 10px;
+  padding: 10px 26px;
+  cursor: pointer;
+  box-shadow: 0 3px 8px rgba(0,0,0,.4);
+  transition: transform .12s ease, filter .12s ease;
+}
+.btn:hover  { filter: brightness(1.12); transform: translateY(-1px); }
+.btn:active { transform: translateY(1px); }
+
+.btn-big { font-size: 26px; padding: 14px 48px; }
+
+.btn-danger {
+  background: linear-gradient(#c8563e, #93341f);
+  animation: pulse 1.1s ease infinite;
+}
+@keyframes pulse {
+  0%, 100% { box-shadow: 0 3px 8px rgba(0,0,0,.4); }
+  50% { box-shadow: 0 0 22px 6px rgba(230,120,80,.55); }
+}
+
+#pickup-btn {
+  position: absolute;
+  left: 50%; top: 402px;
+  transform: translateX(-50%);
+  z-index: 950;
+}
+
+#auto-btn {
+  position: absolute;
+  right: 30px; bottom: 30px;
+  z-index: 950;
+}
+
+#hud {
+  position: absolute;
+  top: 14px; right: 14px;
+  display: flex; gap: 10px;
+  z-index: 960;
+}
+
+.btn-icon {
+  width: 46px; height: 46px;
+  padding: 0;
+  font-size: 21px;
+  line-height: 1;
+  border-radius: 50%;
+}
+
+/* ---------- overlays ---------- */
+
+.overlay {
+  position: absolute; inset: 0;
+  display: flex;
+  align-items: center; justify-content: center;
+  background: rgba(4, 20, 10, .78);
+  backdrop-filter: blur(3px);
+  z-index: 1000;
+  transition: opacity .3s ease;
+}
+.overlay.hidden { display: none; }
+
+.panel {
+  text-align: center;
+  background: linear-gradient(160deg, #1c5a32, #123c20);
+  border: 3px solid rgba(255,217,119,.5);
+  border-radius: 20px;
+  padding: 44px 60px;
+  box-shadow: 0 12px 50px rgba(0,0,0,.6);
+  max-width: 620px;
+}
+
+.panel-wide { max-width: 760px; padding: 34px 48px; }
+
+.panel h1 {
+  color: var(--gold);
+  font-size: 58px;
+  letter-spacing: 3px;
+  text-shadow: 0 3px 0 rgba(0,0,0,.4);
+}
+
+.panel h2 { color: var(--gold); font-size: 34px; margin-bottom: 14px; }
+
+.subtitle {
+  color: rgba(255,255,255,.8);
+  font-size: 21px;
+  font-style: italic;
+  margin: 2px 0 18px;
+}
+
+.blurb {
+  color: rgba(255,255,255,.92);
+  font-size: 18px;
+  line-height: 1.5;
+  margin-bottom: 26px;
+}
+.blurb b { color: var(--gold); }
+
+.rules-text {
+  text-align: left;
+  color: rgba(255,255,255,.92);
+  font-size: 16.5px;
+  line-height: 1.45;
+  margin-bottom: 22px;
+}
+.rules-text p { margin-bottom: 9px; }
+.rules-text b { color: var(--gold); }
+
+.panel .btn { margin: 6px; }
+
+.hidden { display: none !important; }

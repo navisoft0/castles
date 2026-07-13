@@ -1,0 +1,12 @@
+Castles — Jake's Way
+====================
+
+Art & audio assets (all Creative Commons Zero / CC0):
+
+- Playing card sprites: "Boardgame Pack" by Kenney (https://kenney.nl / https://kenney.itch.io)
+- Card sound effects: "Casino Audio" by Kenney (https://kenney.nl / https://kenney.itch.io)
+
+Both packs are free game assets published on https://itch.io/game-assets/free
+under the CC0 license: http://creativecommons.org/publicdomain/zero/1.0/
+
+Game code: original, written for this project.
